@@ -1,0 +1,360 @@
+"use client";
+
+import { Suspense, useMemo, useRef } from "react";
+import { useFrame } from "@react-three/fiber";
+import { Text } from "@react-three/drei";
+import type { Group } from "three";
+import IssueShell from "../_IssueShell";
+import { ISSUES } from "../registry";
+import { RANGES } from "../timeline";
+import { ArtPanel } from "../04-origin/Origin";
+import { toonRamp } from "@/lib/toon";
+import { useScrollStore } from "@/lib/scrollStore";
+import { lettering } from "@/lib/content";
+import { clamp01, easeOutCubic } from "@/lib/shots";
+
+/**
+ * Issue #0 -- the COVER (S7 Phase 1). The loading screen IS Issue #1's
+ * printed comic cover: at t=0 four art layers sit almost coplanar so the
+ * whole thing reads as a flat print; as t moves 0->0.030 the layers
+ * separate in z (pure f(t)) while the camera crash-dollies in, feeding the
+ * crash-through tear in the 0.030-0.040 gutter. Attract mode (before
+ * scroll) breathes the layers; the DOM attract prompt lives in
+ * components/Lettering.tsx -- not here.
+ *
+ * All copy comes from lettering.cover (lib/content.ts). In-scene cover
+ * type is drei Text INSIDE the post pipeline deliberately: the print
+ * treatment IS the cover look (crisp solid fills only, S2.16).
+ */
+
+// S0.4 Cover palette row
+const PAPER = "#F2EAD9";
+const INK = "#201D18";
+const RED = "#E2574C";
+const TEAL = "#2BB3A3";
+
+// Not a cover-row color: this is the hero plate's own field amber (the same
+// value Noir lights its window with), used ONLY as the stand-in fill while
+// that plate decodes, so the swap is a content change and not a color step.
+const AMBER = "#FFB347";
+
+const BANGERS = "/fonts/Bangers-Regular.ttf";
+const COVER_END = RANGES[0]![1];
+
+// Hero panel = the desk-figure art (same plate the Noir window prints), sized
+// to the source 4:5 so ArtPanel's aspect crop is a no-op, and small enough
+// that the framed corners stay inside the sunburst's paper ring (r 2.28).
+const HERO = { w: 2.5, h: 3.125, border: 0.08 };
+
+// Masthead splits into a small kicker line + a big main line so long names
+// ("RAVISH KUMAR", 12 chars) never clip or collide with the price box.
+// Sizes derive from string length -- content.ts can change without relayout.
+const MAST_WORDS = lettering.cover.masthead.split(" ");
+const MAST_KICKER = MAST_WORDS.length > 1 ? MAST_WORDS[0]! : "";
+const MAST_MAIN =
+  MAST_WORDS.length > 1 ? MAST_WORDS.slice(1).join(" ") : lettering.cover.masthead;
+const MAST_MAIN_SIZE = Math.min(1.18, 9.4 / Math.max(MAST_MAIN.length, 1));
+const MAST_KICKER_SIZE = Math.min(0.56, 4.2 / Math.max(MAST_KICKER.length, 1));
+
+// z at full separation (wu) + tiny coplanar base so t=0 never z-fights
+const LAYER = {
+  art: { base: 0.015, depth: 0.55 },
+  hero: { base: 0.03, depth: 1.3 },
+  letter: { base: 0.05, depth: 2.1 },
+} as const;
+
+const RAY_COUNT = 16;
+
+export default function Cover({ index }: { index: number }) {
+  const issue = ISSUES[index]!;
+  const ramp = toonRamp();
+  const art = useRef<Group>(null);
+  const hero = useRef<Group>(null);
+  const letter = useRef<Group>(null);
+
+  // barcode bars derived deterministically from the GitHub handle
+  const barcode = useMemo(() => {
+    const bars: { x: number; w: number }[] = [];
+    let x = 0;
+    for (const ch of lettering.cover.barcode) {
+      const c = ch.charCodeAt(0);
+      const w1 = 0.022 + (c % 3) * 0.012;
+      bars.push({ x, w: w1 });
+      x += w1 + 0.016;
+      const w2 = 0.022 + ((c >> 3) % 3) * 0.012;
+      bars.push({ x, w: w2 });
+      x += w2 + 0.024;
+    }
+    return { bars, width: x - 0.024 };
+  }, []);
+
+  useFrame(({ clock }) => {
+    const { t, reducedMotion } = useScrollStore.getState();
+    // depth separation: pure f(t), fully open by the end of the cover range
+    const sep = easeOutCubic(clamp01(t / COVER_END));
+    // attract breathing fades out as the print gains real depth
+    const breathe = reducedMotion ? 0 : 1 - sep;
+    const el = clock.elapsedTime;
+    // breathe term stays >= 0: a raw sine dips layers BEHIND the opaque
+    // paper board (z < 0) and flat shapes vanish for half of every cycle.
+    // ONE shared phase for all layers: with per-layer phases the art sine
+    // can overtake the hero sine and the burst disc plane rises INTO the
+    // hero panel's z span, clipping it. Shared phase + amplitudes that grow
+    // with the layer keep art < hero < letter invariant for every t and
+    // every breath.
+    const z = (l: { base: number; depth: number }, amp: number) =>
+      l.base + l.depth * sep + breathe * amp * (0.5 + 0.5 * Math.sin(el * 0.85));
+    if (art.current) art.current.position.z = z(LAYER.art, 0.05);
+    if (hero.current) hero.current.position.z = z(LAYER.hero, 0.09);
+    if (letter.current) letter.current.position.z = z(LAYER.letter, 0.13);
+  });
+
+  return (
+    <IssueShell index={index} issue={issue}>
+      {/* ink void behind the floating print */}
+      <mesh position={[0, 1, -8]}>
+        <planeGeometry args={[70, 70]} />
+        <meshToonMaterial color={INK} gradientMap={ramp} />
+      </mesh>
+
+      {/* the cover, centered at y=1 (camera in shots.ts frames this) */}
+      <group position={[0, 1, 0]}>
+        {/* L0 paper board + printed trim frame (stays flat, receives the tear) */}
+        <mesh>
+          <planeGeometry args={[6.4, 9.6]} />
+          <meshToonMaterial color={PAPER} gradientMap={ramp} />
+        </mesh>
+        <mesh position={[0, 4.73, 0.008]}>
+          <planeGeometry args={[6.4, 0.14]} />
+          <meshToonMaterial color={INK} gradientMap={ramp} />
+        </mesh>
+        <mesh position={[0, -4.73, 0.008]}>
+          <planeGeometry args={[6.4, 0.14]} />
+          <meshToonMaterial color={INK} gradientMap={ramp} />
+        </mesh>
+        <mesh position={[-3.13, 0, 0.008]}>
+          <planeGeometry args={[0.14, 9.6]} />
+          <meshToonMaterial color={INK} gradientMap={ramp} />
+        </mesh>
+        <mesh position={[3.13, 0, 0.008]}>
+          <planeGeometry args={[0.14, 9.6]} />
+          <meshToonMaterial color={INK} gradientMap={ramp} />
+        </mesh>
+
+        {/* L1 -- background art: comic sunburst. Teal core disc, tapered red
+            wedge rays (alternating long/short, bases tucked under the disc),
+            thin paper ring so it reads as printed energy, not a solid ball */}
+        <group ref={art}>
+          {Array.from({ length: RAY_COUNT }, (_, i) => {
+            const a = (i / RAY_COUNT) * Math.PI * 2 + 0.13;
+            const long = i % 2 === 0;
+            const r = long ? 2.35 : 2.3;
+            return (
+              <mesh
+                key={i}
+                position={[Math.cos(a) * r, -0.4 + Math.sin(a) * r, -0.004]}
+                rotation={[0, 0, a]}
+                scale={[long ? 0.65 : 0.5, long ? 0.42 : 0.34, 1]}
+              >
+                <circleGeometry args={[1, 3]} />
+                <meshToonMaterial color={RED} gradientMap={ramp} />
+              </mesh>
+            );
+          })}
+          <mesh position={[0, -0.4, 0]}>
+            <circleGeometry args={[2.55, 48]} />
+            <meshToonMaterial color={TEAL} gradientMap={ramp} />
+          </mesh>
+          <mesh position={[0, -0.4, 0.002]}>
+            <ringGeometry args={[2.28, 2.36, 64]} />
+            <meshToonMaterial color={PAPER} gradientMap={ramp} />
+          </mesh>
+        </group>
+
+        {/* L2 -- hero art: the dev at the desk (user directive 2026-09-07,
+            replacing the pounce cat). Same baked plate the Noir window
+            prints, tipped onto the sunburst as a cover photo: ink border,
+            slight tilt for the comic-cover energy, centered on the disc so
+            the paper ring reads all the way round. The click still meows:
+            an unsignposted gag now that the cat it sat on is gone, which is
+            what the rest of the S5b.5 cats are too. */}
+        <group
+          ref={hero}
+          position={[0, -0.4, 0.03]}
+          rotation={[0, 0, -0.035]}
+          onClick={(e) => {
+            e.stopPropagation();
+            useScrollStore.getState().meow();
+          }}
+        >
+          {/* printed ink border, one plane behind the art */}
+          <mesh position={[0, 0, -0.004]}>
+            <planeGeometry args={[HERO.w + HERO.border * 2, HERO.h + HERO.border * 2]} />
+            <meshToonMaterial color={INK} gradientMap={ramp} />
+          </mesh>
+          {/* amber fill stands in while the texture loads -- LOCAL Suspense,
+              the rest of the cover never unmounts. Unlit basic material to
+              match the ArtPanel it hands off to (a toon+ramp fill would make
+              the swap a luminance step, not just a content change). */}
+          <Suspense
+            fallback={
+              <mesh>
+                <planeGeometry args={[HERO.w, HERO.h]} />
+                <meshBasicMaterial color={AMBER} />
+              </mesh>
+            }
+          >
+            {/* trim eats the plate's own baked canvas-edge ink so it cannot
+                double the border plane behind it */}
+            <ArtPanel
+              url="/images/noir-window-figure.png"
+              w={HERO.w}
+              h={HERO.h}
+              z={0}
+              trim={0.012}
+            />
+          </Suspense>
+        </group>
+
+        {/* L3 -- lettering plate: masthead, issue line, price box, blurb, barcode */}
+        <group ref={letter}>
+          <Suspense fallback={null}>
+            {/* two-line masthead: small kicker centered above the big main
+                line -- both clear of the price box in the top-left corner */}
+            {MAST_KICKER !== "" && (
+              <Text
+                font={BANGERS}
+                fontSize={MAST_KICKER_SIZE}
+                letterSpacing={0.3}
+                position={[0, 4.14, 0]}
+                color={INK}
+                anchorX="center"
+                anchorY="middle"
+              >
+                {MAST_KICKER}
+              </Text>
+            )}
+            {/* main line with a solid offset print shadow (crisp, zero blur) */}
+            <Text
+              font={BANGERS}
+              fontSize={MAST_MAIN_SIZE}
+              letterSpacing={0.02}
+              position={[0.06, 3.08, -0.006]}
+              color={RED}
+              anchorX="center"
+              anchorY="middle"
+            >
+              {MAST_MAIN}
+            </Text>
+            <Text
+              font={BANGERS}
+              fontSize={MAST_MAIN_SIZE}
+              letterSpacing={0.02}
+              position={[0, 3.14, 0]}
+              color={INK}
+              anchorX="center"
+              anchorY="middle"
+            >
+              {MAST_MAIN}
+            </Text>
+            <Text
+              font={BANGERS}
+              fontSize={0.26}
+              letterSpacing={0.08}
+              position={[0, 2.4, 0]}
+              color={INK}
+              anchorX="center"
+              anchorY="middle"
+            >
+              {lettering.cover.issueLine}
+            </Text>
+
+            {/* price-box gag, top-left corner -- beside the kicker, fully
+                above the main masthead line (no overlap) */}
+            <group position={[-2.42, 4.14, 0.012]}>
+              <mesh>
+                <planeGeometry args={[1.4, 0.94]} />
+                <meshToonMaterial color={INK} gradientMap={ramp} />
+              </mesh>
+              <mesh position={[0, 0, 0.003]}>
+                <planeGeometry args={[1.3, 0.84]} />
+                <meshToonMaterial color={PAPER} gradientMap={ramp} />
+              </mesh>
+              <Text
+                font={BANGERS}
+                fontSize={0.2}
+                maxWidth={1.15}
+                textAlign="center"
+                lineHeight={1.1}
+                position={[0, 0, 0.006]}
+                color={INK}
+                anchorX="center"
+                anchorY="middle"
+              >
+                {lettering.cover.priceBox}
+              </Text>
+            </group>
+
+            {/* blurb banner */}
+            <group position={[0, -2.95, 0]}>
+              <mesh>
+                <planeGeometry args={[6.08, 1.14]} />
+                <meshToonMaterial color={INK} gradientMap={ramp} />
+              </mesh>
+              <mesh position={[0, 0, 0.003]}>
+                <planeGeometry args={[6.0, 1.06]} />
+                <meshToonMaterial color={RED} gradientMap={ramp} />
+              </mesh>
+              <Text
+                font={BANGERS}
+                fontSize={0.27}
+                maxWidth={5.6}
+                textAlign="center"
+                lineHeight={1.15}
+                position={[0, 0, 0.006]}
+                color={PAPER}
+                anchorX="center"
+                anchorY="middle"
+              >
+                {lettering.cover.blurb}
+              </Text>
+            </group>
+
+            {/* barcode = GitHub handle, bottom-right */}
+            <group position={[1.95, -4.02, 0.01]}>
+              <mesh>
+                <planeGeometry args={[1.88, 1.08]} />
+                <meshToonMaterial color={INK} gradientMap={ramp} />
+              </mesh>
+              <mesh position={[0, 0, 0.003]}>
+                <planeGeometry args={[1.8, 1.0]} />
+                <meshToonMaterial color={PAPER} gradientMap={ramp} />
+              </mesh>
+              {barcode.bars.map((b, i) => (
+                <mesh
+                  key={i}
+                  position={[-barcode.width / 2 + b.x + b.w / 2, 0.14, 0.006]}
+                  scale={[b.w, 0.52, 1]}
+                >
+                  <planeGeometry />
+                  <meshToonMaterial color={INK} gradientMap={ramp} />
+                </mesh>
+              ))}
+              <Text
+                font={BANGERS}
+                fontSize={0.15}
+                letterSpacing={0.12}
+                position={[0, -0.32, 0.006]}
+                color={INK}
+                anchorX="center"
+                anchorY="middle"
+              >
+                {lettering.cover.barcode}
+              </Text>
+            </group>
+          </Suspense>
+        </group>
+      </group>
+    </IssueShell>
+  );
+}

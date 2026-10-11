@@ -1,0 +1,45 @@
+{
+  "name": "ravish-kumar-portfolio",
+  "version": "0.1.0",
+  "private": true,
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "scripts": {
+    "dev": "next dev",
+    "prebuild": "node scripts/bake-contributions.mjs",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "bake:audio": "node scripts/bake-audio.mjs"
+  },
+  "dependencies": {
+    "@gsap/react": "2.1.2",
+    "@react-three/drei": "10.7.8",
+    "@react-three/fiber": "9.7.0",
+    "@react-three/postprocessing": "3.1.1",
+    "framer-motion": "13.4.0",
+    "gsap": "3.15.0",
+    "lenis": "1.3.26",
+    "next": "16.3.5",
+    "postprocessing": "6.39.5",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "three": "0.186.0",
+    "tone": "15.1.22",
+    "zustand": "5.0.15"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "4.3.3",
+    "@types/node": "26.6.1",
+    "@types/react": "19.2.18",
+    "@types/react-dom": "19.2.7",
+    "@types/three": "0.186.0",
+    "tailwindcss": "4.3.3",
+    "typescript": "6.0.3"
+  },
+  "overrides": {
+    "postcss": "^8.5.18",
+    "sharp": "^0.35.0"
+  }
+}
