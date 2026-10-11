@@ -1,0 +1,48 @@
+# Ravish Kumar
+
+> Full-Stack Developer & AI Engineer (B.Tech in Cybersecurity & Forensics, Sandip University, Nashik).
+> Winner of 1st Place at MLH Hack Days, Smart India Hackathon Top 15 Finalist, and NASA Space Apps participant.
+> Portfolio presented as a scroll-driven comic book (WebGL) with an accessible static Print Edition.
+
+Stack: Python, React, PyTorch, JavaScript, SQL, OpenCV, YOLO, Docker, C/C++, Java.
+
+The site renders two ways from one source. The animated version is a WebGL
+comic: twelve issues, an original score, and a companion cat. The Print Edition is the same
+run set flat as semantic HTML -- shipping in the initial server response so
+the full content is accessible and indexable without JavaScript or WebGL.
+
+## Selected Projects
+
+- [Aarogya Platform](https://github.com/ravishkumar): 1st Place MLH Hack Days winner.
+  Full-stack healthcare management platform for patient tracking, medication reminders,
+  and assisted triage built under real hackathon deadlines. Python, React, SQL, AI/ML.
+- [M2RISK](https://github.com/ravishkumar): Road Hazard Intelligence System.
+  Data-processing and model-training pipelines on real-world traffic datasets to predict
+  road near-misses. Python, PyTorch, YOLO, OpenCV.
+- [RAVE](https://github.com/ravishkumar): AI Personal Assistant.
+  Voice-driven assistant for search, application control, and automated task workflows.
+  Python, Automation.
+
+## Leadership & Achievements
+
+- 1st Place Winner -- MLH Hack Days
+- Top 15 Finalist -- Smart India Hackathon 2025
+- Participant -- NASA Space Apps Challenge
+- Class Representative -- Sandip University
+- Discipline Head -- Webmaster Club & eSports Club | Secretary -- SEWA Club
+- Digital Literacy Volunteer -- Taught computer skills to students in government schools
+
+## Education
+
+- B.Tech in Computer Science & Engineering (Cybersecurity & Forensics) (2025-2029 Expected)
+  Sandip University, Nashik
+- Higher Secondary (11th-12th) -- Delhi Public School, Nashik
+- Secondary School (up to 10th) -- Army Public School, Devlali
+
+## Contact & Links
+
+- Email: ravishkumar.v1.9@gmail.com
+- Phone: +91 83790 05723
+- Location: Wadner gate, Nashik, Maharashtra
+- GitHub: https://github.com/ravishkumar
+- LinkedIn: https://www.linkedin.com/in/ravishkumar/

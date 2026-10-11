@@ -1,0 +1,255 @@
+export type Vec3 = [number, number, number];
+
+export interface Pose {
+  position: Vec3;
+  target: Vec3;
+  /** radians around the view axis (dutch) */
+  roll?: number;
+  fov?: number;
+}
+
+export type ShotKind = "hold" | "dolly" | "orbit" | "crash" | "whip" | "spline";
+
+/** Full S0.3 transition vocabulary. */
+export type TransitionKind =
+  | "cut"
+  | "drift"
+  | "whip"
+  | "dot-zoom"
+  | "crash-through"
+  | "title-drop"
+  | "panel-wipe"
+  | "panel-portal"
+  | "stamp"
+  | "paper-tear"
+  | "page-flip"
+  | "ink-flood"
+  | "dot-match";
+
+/** What the TransitionEffect can render (Phase 2: full S5 library). */
+export type TransitionMode =
+  | "cut"
+  | "drift"
+  | "whip"
+  | "dot-zoom"
+  | "crash-through"
+  | "panel-wipe"
+  | "paper-tear"
+  | "page-flip"
+  | "stamp"
+  | "dot-match"
+  | "ink-flood";
+
+// Phase 2: every S5 transition is native. Two kinds stay mapped by design:
+// title-drop -> whip (S5b.3: the slam is an authored-time BEAT via
+// lib/beats.ts; the gutter itself only carries the whip into Issue 2), and
+// panel-portal -> panel-wipe (a portal fly-through is scene/camera work,
+// not a post op; "panel grows to full bleed" is the nearest native analog
+// and reads correctly for the Issue 4 quiet-valley exit).
+// drift (intra-issue only): a CONTINUITY gutter -- the post pass renders
+// nothing and the camera carries straight through. It is NOT a raw cut:
+// S1 bans unstyled pose jumps, so a shot may only declare out: "drift"
+// when its end pose is authored equal to the next shot's from pose
+// (near-zero delta at the mid-gutter snap). Quiet-valley grammar.
+export const TRANSITION_FALLBACK: Record<TransitionKind, TransitionMode> = {
+  cut: "cut",
+  drift: "drift",
+  whip: "whip",
+  "dot-zoom": "dot-zoom",
+  "crash-through": "crash-through",
+  "title-drop": "whip",
+  "panel-wipe": "panel-wipe",
+  "panel-portal": "panel-wipe",
+  stamp: "stamp",
+  "paper-tear": "paper-tear",
+  "page-flip": "page-flip",
+  "ink-flood": "ink-flood",
+  "dot-match": "dot-match",
+};
+
+/** Modes that overlay the outgoing issue's snapshot on the incoming live frame. */
+const SNAPSHOT_MODES = new Set<TransitionMode>([
+  "dot-zoom",
+  "crash-through",
+  "panel-wipe",
+  "paper-tear",
+  "page-flip",
+  "stamp",
+  "dot-match",
+]);
+export const usesSnapshot = (mode: TransitionMode) => SNAPSHOT_MODES.has(mode);
+
+export type EaseFn = (x: number) => number;
+
+export interface Shot {
+  id: string;
+  issue: number;
+  range: [number, number];
+  kind: ShotKind;
+  from: Pose;
+  to?: Pose;
+  ease?: EaseFn;
+  /**
+   * Transition kind for the INTRA-issue gutter after this shot (default
+   * whip). Ignored on an issue's final shot: inter-issue gutters always take
+   * the registry's outTransition. Snapshot-driven kinds (e.g. panel-wipe)
+   * need the issue snapshot fresh at shot tails -- snapshots.retain(issue).
+   */
+  out?: TransitionKind;
+}
+
+export interface ShotSegment {
+  type: "shot";
+  range: [number, number];
+  shot: Shot;
+}
+
+export interface GutterSegment {
+  type: "gutter";
+  range: [number, number];
+  fromShot: Shot;
+  toShot: Shot;
+  kind: TransitionKind;
+  mode: TransitionMode;
+  interIssue: boolean;
+}
+
+export type Segment = ShotSegment | GutterSegment;
+
+export const easeInOut: EaseFn = (x) => x * x * (3 - 2 * x);
+export const easeOutCubic: EaseFn = (x) => 1 - Math.pow(1 - x, 3);
+
+export const clamp01 = (x: number) => Math.min(Math.max(x, 0), 1);
+export const lerp = (a: number, b: number, x: number) => a + (b - a) * x;
+
+const lerpV3 = (a: Vec3, b: Vec3, x: number): Vec3 => [
+  lerp(a[0], b[0], x),
+  lerp(a[1], b[1], x),
+  lerp(a[2], b[2], x),
+];
+
+export function poseAt(shot: Shot, p: number): Pose {
+  const to = shot.to;
+  if (!to) return shot.from;
+  const e = (shot.ease ?? easeInOut)(clamp01(p));
+  return {
+    position: lerpV3(shot.from.position, to.position, e),
+    target: lerpV3(shot.from.target, to.target, e),
+    roll: lerp(shot.from.roll ?? 0, to.roll ?? shot.from.roll ?? 0, e),
+    fov: lerp(shot.from.fov ?? 45, to.fov ?? shot.from.fov ?? 45, e),
+  };
+}
+
+/** Where within a gutter the camera jumps from the outgoing to the incoming shot. */
+function cutPoint(mode: TransitionMode): number {
+  // snapshot modes film the incoming issue for the whole gutter -- the
+  // outgoing issue is only present as its snapshot overlay. cut, whip and
+  // ink-flood jump mid-gutter (ink-flood's full cover hides the jump).
+  return usesSnapshot(mode) ? 0 : 0.5;
+}
+
+export interface TransitionSample {
+  mode: TransitionMode;
+  /** deadbanded local progress through the gutter, 0..1 */
+  p: number;
+  fromIssue: number;
+  toIssue: number;
+}
+
+export interface TimelineSample {
+  segment: Segment;
+  /** issue the camera is filming right now */
+  filmIssue: number;
+  /** issue used for active+/-1 mounting and recipe targeting */
+  activeIssue: number;
+  pose: Pose;
+  shotP: number;
+  shotKind: ShotKind | null;
+  transition: TransitionSample | null;
+}
+
+/**
+ * Build the flat, gap-free segment list: shots as given (their ranges must
+ * not touch), a gutter between every consecutive pair. Inter-issue gutters
+ * take the issue's outTransition kind; intra-issue gutters default to whip.
+ */
+export function compileSegments(
+  shots: Shot[],
+  outTransitionOf: (issue: number) => TransitionKind,
+): Segment[] {
+  const segments: Segment[] = [];
+  for (let i = 0; i < shots.length; i++) {
+    const shot = shots[i]!;
+    segments.push({ type: "shot", range: shot.range, shot });
+    const next = shots[i + 1];
+    if (!next) break;
+    const interIssue = next.issue !== shot.issue;
+    const kind: TransitionKind = interIssue
+      ? outTransitionOf(shot.issue)
+      : (shot.out ?? "whip");
+    segments.push({
+      type: "gutter",
+      range: [shot.range[1], next.range[0]],
+      fromShot: shot,
+      toShot: next,
+      kind,
+      mode: TRANSITION_FALLBACK[kind],
+      interIssue,
+    });
+  }
+  return segments;
+}
+
+/** S2.4 deadband: freeze p just inside gutter edges so hovering never strobes. */
+function deadbandedP(t: number, range: [number, number]): number {
+  const width = range[1] - range[0];
+  const db = Math.min(0.002, width * 0.25);
+  return clamp01((t - range[0] - db) / (width - 2 * db));
+}
+
+/** Pure f(t): the whole camera + transition state for any scroll position. */
+export function evaluateTimeline(t: number, segments: Segment[]): TimelineSample {
+  const tc = clamp01(t);
+  let lo = 0;
+  let hi = segments.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (tc >= segments[mid]!.range[1]) lo = mid + 1;
+    else hi = mid;
+  }
+  const segment = segments[lo]!;
+
+  if (segment.type === "shot") {
+    const [s, e] = segment.range;
+    const p = clamp01((tc - s) / (e - s));
+    return {
+      segment,
+      filmIssue: segment.shot.issue,
+      activeIssue: segment.shot.issue,
+      pose: poseAt(segment.shot, p),
+      shotP: p,
+      shotKind: segment.shot.kind,
+      transition: null,
+    };
+  }
+
+  const p = deadbandedP(tc, segment.range);
+  const afterCut = p >= cutPoint(segment.mode);
+  const filmShot = afterCut ? segment.toShot : segment.fromShot;
+  return {
+    segment,
+    filmIssue: filmShot.issue,
+    activeIssue: p < 0.5 ? segment.fromShot.issue : segment.toShot.issue,
+    pose: afterCut ? poseAt(segment.toShot, 0) : poseAt(segment.fromShot, 1),
+    shotP: 0,
+    shotKind: null,
+    // intra-issue gutters carry the shot-authored kind too (Shot.out);
+    // fromIssue === toIssue there, so recipes never jump mid-issue
+    transition: {
+      mode: segment.mode,
+      p,
+      fromIssue: segment.fromShot.issue,
+      toIssue: segment.toShot.issue,
+    },
+  };
+}

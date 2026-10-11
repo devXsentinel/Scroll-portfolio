@@ -1,0 +1,414 @@
+import type { Filter, FMSynth, Gain, MembraneSynth, Noise, NoiseSynth, Synth } from "tone";
+import { useScrollStore } from "@/lib/scrollStore";
+import { logFire } from "./debug";
+import type { ToneAudioNode } from "tone";
+import { hit } from "./oneshot";
+import type { ToneModule } from "./types";
+import { hash } from "./util";
+
+/**
+ * Wave B: UI / diegetic one-shots (event-driven, NOT f(t)). Every trigger
+ * here is a genuine user event -- a raycast/DOM click, a keystroke, or a
+ * store change (meowCount, jumpCover) -- so none are scrub-fired: there is no
+ * BeatRunner hysteresis window to arm, only per-event idempotence (the store
+ * subs guard s === prev). All variation is a Knuth hash of an integer index
+ * (util hash); no Math.random anywhere. All output rides the sfx bus the
+ * director hands us (Compressor -> Limiter master chain), mixed low.
+ *
+ * GESTURE GATE: the director calls wireUi(T, sfx) only after enableAudio()
+ * has unlocked the AudioContext. Until then `mod` is null and every uiSound /
+ * meow / catPurr call is a no-op, so scene handlers that fire pre-enable
+ * create zero AudioContext and zero output. Post-disable the master out gain
+ * is ramped to 0 by the director, so any late trigger is silent. Synths are
+ * pooled: built once, lazily, on the first real trigger; never per event.
+ */
+
+export type UiKind =
+  | "cmdOk"
+  | "cmdErr"
+  | "linkPress"
+  | "ctaPress"
+  | "openTab"
+  | "key"
+  | "keyBack"
+  | "keyEsc"
+  | "toggleOn"
+  | "toggleOff"
+  | "hover";
+
+interface Mod {
+  T: ToneModule;
+  sfx: ToneAudioNode;
+}
+
+interface Pool {
+  uiBeep: Synth;
+  uiBuzz: FMSynth;
+  uiBuzzLp: Filter;
+  uiTick: Synth;
+  uiThud: MembraneSynth;
+  uiNoise: NoiseSynth;
+  uiNoiseBp: Filter;
+  swishNoise: Noise;
+  swishBp: Filter;
+  swishGain: Gain;
+  meowSynth: FMSynth;
+}
+
+/**
+ * Strictly-increasing start-time gate for one mono voice (local copy of the
+ * moments.ts class -- no cross-import). Bumps a new start past the voice's busy
+ * tail so a second trigger on a SHARED synth (two meows within one meow's
+ * future-scheduled triggerRelease(now+0.38): leap+softLand on a deep jump, a
+ * scene meow racing a click meow, or back-to-back cmdErr/linkPress on uiNoise)
+ * never attacks earlier than the pending release -- which throws Tone's "The
+ * time must be greater than or equal to the last scheduled time" and trips the
+ * director loop catch (global audio disable). No reset: ui.ts has no disable
+ * path (pool survives), and Tone's clock only advances, so a stale free is
+ * always in the past on re-enable.
+ */
+class VoiceGate {
+  private free = 0;
+  constructor(private maxLag = Infinity) {}
+  at(now: number, busy: number): number {
+    const a = now <= this.free ? this.free + 0.008 : now;
+    // backlog drop (wheelFree pattern): once the adjusted start would land more
+    // than maxLag past now, the voice is so far behind that the sound is already
+    // stale -- return -1 (leaving `free` untouched) so the caller skips it, else
+    // a rapid meow spam grows an ever-longer serialized tail. Infinity = no cap.
+    if (a > now + this.maxLag) return -1;
+    this.free = a + busy;
+    return a;
+  }
+}
+const meowGate = new VoiceGate(0.7); // shared meowSynth; drop once backlog > 0.7s
+const uiNoiseGate = new VoiceGate(); // shared uiNoise (cmdErr / linkPress / ctaPress)
+
+let mod: Mod | null = null;
+let pool: Pool | null = null;
+let subscribed = false;
+
+/** Build the pooled synths once (lazy, on first real trigger). */
+function ensure(): Pool | null {
+  const m = mod;
+  if (!m) return null;
+  if (pool) return pool;
+  const { T, sfx } = m;
+
+  const uiBeep = new T.Synth({
+    oscillator: { type: "fattriangle", count: 2, spread: 10 },
+    envelope: { attack: 0.002, decay: 0.06, sustain: 0, release: 0.05 },
+    volume: -15,
+  }).connect(sfx);
+
+  const uiBuzz = new T.FMSynth({
+    harmonicity: 1,
+    modulationIndex: 12,
+    envelope: { attack: 0.002, decay: 0.14, sustain: 0, release: 0.02 },
+    volume: -14,
+  });
+  const uiBuzzLp = new T.Filter(800, "lowpass");
+  uiBuzz.chain(uiBuzzLp, sfx);
+
+  const uiTick = new T.Synth({
+    oscillator: { type: "square" },
+    envelope: { attack: 0.001, decay: 0.012, sustain: 0, release: 0.008 },
+    volume: -20,
+  }).connect(sfx);
+
+  const uiThud = new T.MembraneSynth({
+    pitchDecay: 0.05,
+    octaves: 4,
+    envelope: { attack: 0.002, decay: 0.2, sustain: 0, release: 0.08 },
+    volume: -10,
+  }).connect(sfx);
+
+  const uiNoise = new T.NoiseSynth({
+    noise: { type: "pink" },
+    envelope: { attack: 0.001, decay: 0.03, sustain: 0 },
+    volume: -12,
+  });
+  const uiNoiseBp = new T.Filter(1200, "bandpass");
+  uiNoise.chain(uiNoiseBp, sfx);
+
+  // swish: one continuous noise gated by its own gain envelope (no per-event
+  // source alloc; two swishes never realistically overlap, and a fresh
+  // cancelScheduledValues re-arms cleanly if they do).
+  const swishNoise = new T.Noise({ type: "pink", volume: -14 });
+  const swishBp = new T.Filter(600, "bandpass");
+  const swishGain = new T.Gain(0);
+  swishNoise.chain(swishBp, swishGain, sfx);
+  swishNoise.start();
+
+  const meowSynth = new T.FMSynth({
+    harmonicity: 1.5,
+    modulationIndex: 4,
+    envelope: { attack: 0.03, decay: 0.2, sustain: 0.5, release: 0.12 },
+    modulationEnvelope: { attack: 0.05, decay: 0.2, sustain: 0.3, release: 0.1 },
+    volume: -12,
+  }).connect(sfx);
+
+  pool = {
+    uiBeep,
+    uiBuzz,
+    uiBuzzLp,
+    uiTick,
+    uiThud,
+    uiNoise,
+    uiNoiseBp,
+    swishNoise,
+    swishBp,
+    swishGain,
+    meowSynth,
+  };
+  return pool;
+}
+
+/** Fire the shared swish: sweep the bandpass startF -> endF over dur, auto-stop. */
+function swish(p: Pool, m: Mod, startF: number, endF: number, dur: number): void {
+  const now = m.T.now();
+  const g = p.swishGain.gain;
+  g.cancelScheduledValues(now);
+  g.setValueAtTime(0, now);
+  g.linearRampToValueAtTime(1, now + 0.02);
+  g.linearRampToValueAtTime(0, now + dur);
+  const f = p.swishBp.frequency;
+  f.cancelScheduledValues(now);
+  f.setValueAtTime(startF, now);
+  f.exponentialRampToValueAtTime(endF, now + dur);
+}
+
+/** Event-driven UI one-shots from scene handlers / the director. */
+export function uiSound(kind: UiKind, seed = 0): void {
+  const m = mod;
+  if (!m) return;
+  const p = ensure();
+  if (!p) return;
+  const now = m.T.now();
+  switch (kind) {
+    case "cmdOk": {
+      // two-note retro ACK; per-command pitch identity within +/- 100 cents
+      const f0 = 660 * Math.pow(2, ((seed % 201) - 100) / 1200);
+      p.uiBeep.triggerAttackRelease(f0, 0.045, now, 0.7);
+      p.uiBeep.triggerAttackRelease(f0 * 1.5, 0.05, now + 0.05, 0.7);
+      break;
+    }
+    case "cmdErr": {
+      // gritty descending bzzt through the fixed 800 Hz lowpass...
+      p.uiBuzz.triggerAttack(200, now, 0.9);
+      p.uiBuzz.frequency.rampTo(150, 0.13, now);
+      p.uiBuzz.triggerRelease(now + 0.14);
+      // ...with a CRT static zap layered on (shared uiNoise voice, bp swept up
+      // then rested back to 1200 so linkPress/ctaPress snaps stay unchanged).
+      p.uiNoiseBp.frequency.rampTo(2400, 0.03, now);
+      p.uiNoise.triggerAttackRelease(0.05, uiNoiseGate.at(now, 0.06), 0.5);
+      p.uiNoiseBp.frequency.rampTo(1200, 0.08, now + 0.06);
+      logFire("cmdErr");
+      break;
+    }
+    case "linkPress": {
+      // ka-chunk (thud) + paper snap (noise) + page opening (rising beeps)
+      p.uiThud.triggerAttackRelease("A1", 0.08, now, 0.8);
+      p.uiNoise.triggerAttackRelease(0.03, uiNoiseGate.at(now, 0.06), 0.5);
+      p.uiBeep.triggerAttackRelease(700, 0.05, now, 0.7);
+      p.uiBeep.triggerAttackRelease(1050, 0.05, now + 0.055, 0.7);
+      break;
+    }
+    case "ctaPress": {
+      // heavier manufactured press + a downward swish hinting the scroll
+      p.uiThud.triggerAttackRelease("F1", 0.1, now, 0.9);
+      p.uiNoise.triggerAttackRelease(0.03, uiNoiseGate.at(now, 0.06), 0.5);
+      swish(p, m, 1100, 450, 0.18);
+      break;
+    }
+    case "openTab": {
+      // bright rising open blip + a hair of tab detent; per-row pitch step
+      const top = 1320 * (1 + 0.03 * seed);
+      p.uiBeep.triggerAttack(880, now, 0.7);
+      p.uiBeep.frequency.rampTo(top, 0.07, now);
+      p.uiBeep.triggerRelease(now + 0.08);
+      p.uiThud.triggerAttackRelease("C2", 0.05, now, 0.55);
+      break;
+    }
+    case "key": {
+      // Sample first, synth as the fallback. hit() returns false until the bank
+      // lands, so typing is audible from the first frame and quietly improves.
+      if (hit("ui.key", { seed, at: now })) break;
+      // organic mechanical click; deterministic per-position jitter
+      p.uiTick.triggerAttackRelease(1400 + (hash(seed) % 120), 0.008, now, 0.6);
+      break;
+    }
+    case "keyBack": {
+      p.uiTick.triggerAttackRelease(900, 0.01, now, 0.4);
+      break;
+    }
+    case "keyEsc": {
+      // three quick descending ticks = "cleared"
+      p.uiTick.triggerAttackRelease(1200, 0.008, now, 0.5);
+      p.uiTick.triggerAttackRelease(900, 0.008, now + 0.03, 0.5);
+      p.uiTick.triggerAttackRelease(650, 0.008, now + 0.06, 0.5);
+      break;
+    }
+    case "toggleOn": {
+      // D5 -> A5 print-press chime; first thing the user hears
+      p.uiBeep.triggerAttackRelease(587.33, 0.05, now, 0.75);
+      p.uiBeep.triggerAttackRelease(880, 0.05, now + 0.05, 0.75);
+      break;
+    }
+    case "toggleOff": {
+      // A5 -> D5 descending, softer
+      p.uiBeep.triggerAttackRelease(880, 0.05, now, 0.55);
+      p.uiBeep.triggerAttackRelease(587.33, 0.05, now + 0.05, 0.55);
+      break;
+    }
+    case "hover": {
+      // tiny tick on button hover-in; call site latches false -> true only
+      p.uiTick.triggerAttackRelease(1800, 0.006, now, 0.3);
+      logFire("hover");
+      break;
+    }
+  }
+}
+
+/**
+ * The shared cat voice. Exported so lib/audio/moments.ts fires the SAME cat as
+ * the ui triggers -- one voice, no duplicate.
+ *
+ * SAMPLE FIRST, SYNTH AS THE FALLBACK. Harley is a real cat, so she is now four
+ * real meows (`fol.meow`, generated on Stable Audio 3) and the FMSynth below is
+ * what plays in the frames before the bank lands, or on the low tier where the
+ * bank is trimmed. That is the same contract every other hit in this engine
+ * has: `hit()` returns false and the call site falls through, so a cold bank is
+ * inaudible rather than silent.
+ *
+ * `base` is the seed, not a frequency, on the sample path: the caller's own
+ * pitch choice keeps picking the caller's own round robin, so the desk cat and
+ * the cover cat stay recognisably different animals without any new state.
+ *
+ * Gesture-gated + pool-lazy like every ui trigger (no-op until wireUi + the
+ * first ensure()).
+ */
+export function fireMeowVoice(now: number, base: number, harm: number): void {
+  const m = mod;
+  if (!m) return;
+  const p = ensure();
+  if (!p) return;
+  if (hit("fol.meow", { seed: Math.round(base), at: now })) {
+    logFire("meow-sample");
+    return;
+  }
+  now = meowGate.at(now, 0.55); // release scheduled at now+0.38; keep the next attack after it
+  if (now < 0) return; // backlog past maxLag -> drop this meow
+  const s = p.meowSynth;
+  s.harmonicity.value = harm;
+  s.modulationIndex.value = 4;
+  s.triggerAttack(base, now, 0.8);
+  s.frequency.rampTo(base * 1.32, 0.1, now + 0.02); // ME-OW: dip up...
+  s.frequency.rampTo(base * 0.82, 0.2, now + 0.14); // ...then down
+  s.triggerRelease(now + 0.38);
+}
+
+/** Cat contours: 4 deterministic families selected by hash(count). */
+export function meow(count: number): void {
+  const m = mod;
+  if (!m) return;
+  const p = ensure();
+  if (!p) return;
+  const h = hash(count);
+  const fam = (h >>> 16) % 4;
+  if (fam === 3) {
+    catPurr();
+    return;
+  }
+  const now = m.T.now();
+  // The sampled cat covers the three vocal families: four real meows already
+  // carry more contour variety than three synth envelopes did, and `count`
+  // walks the round robin. The families below stay as the fallback voice.
+  if (hit("fol.meow", { seed: count, at: now })) {
+    logFire("meow-sample");
+    return;
+  }
+  const s = p.meowSynth;
+  const base = 480 + (h % 200);
+  if (fam === 2) {
+    // CHIRP: single short pop, low modIndex, no dip
+    const gnow = meowGate.at(now, 0.55); // shared meowSynth: stagger past any pending release
+    if (gnow < 0) return; // backlog past maxLag -> drop
+    s.harmonicity.value = 1.3 + fam * 0.13;
+    s.modulationIndex.value = 2;
+    s.triggerAttackRelease(600 + (h % 120), 0.16, gnow, 0.8);
+    return;
+  }
+  if (fam === 1) {
+    // QUESTION: end freq ramps up, tail rises a touch more
+    const gnow = meowGate.at(now, 0.55); // shared meowSynth: stagger past any pending release
+    if (gnow < 0) return; // backlog past maxLag -> drop
+    s.harmonicity.value = 1.3 + fam * 0.13;
+    s.modulationIndex.value = 4;
+    s.triggerAttack(base, gnow, 0.8);
+    const top = base * 1.4;
+    s.frequency.rampTo(top, 0.24, gnow + 0.02);
+    s.frequency.rampTo(top * 1.06, 0.08, gnow + 0.26);
+    s.triggerRelease(gnow + 0.36);
+    return;
+  }
+  // 0 ME-OW: the shared voice (also fired by moments' cat sfx)
+  fireMeowVoice(now, base, 1.3);
+}
+
+/** TRILL / PURR contour -- the purr flavor without hover (meow family 3). */
+export function catPurr(): void {
+  const m = mod;
+  if (!m) return;
+  const p = ensure();
+  if (!p) return;
+  const now = meowGate.at(m.T.now(), 0.55); // shared meowSynth: purr releases at now+0.42
+  if (now < 0) return; // backlog past maxLag -> drop
+  const s = p.meowSynth;
+  const base = 300;
+  s.harmonicity.value = 1.6;
+  s.modulationIndex.value = 4;
+  s.modulationIndex.rampTo(8, 0.3, now);
+  s.triggerAttack(base, now, 0.7);
+  // two fast +/- 8% wobbles at ~18 Hz, then settle
+  s.frequency.rampTo(base * 1.08, 0.028, now);
+  s.frequency.rampTo(base * 0.92, 0.028, now + 0.028);
+  s.frequency.rampTo(base * 1.08, 0.028, now + 0.056);
+  s.frequency.rampTo(base * 0.92, 0.028, now + 0.084);
+  s.frequency.rampTo(base, 0.16, now + 0.112);
+  s.triggerRelease(now + 0.42);
+}
+
+/**
+ * Director hands us (T, sfx) here, once, post-enable. Owns the meow-variety
+ * and jump-land store subscriptions (director drops its inline meow closure).
+ * Subscriptions attach once and survive disable; they inherit the gesture
+ * gate because meow / uiSound / swish all early-return while `mod` is null,
+ * and are silent post-disable via the director's out-gain ramp.
+ */
+export function wireUi(T: ToneModule, sfx: ToneAudioNode): void {
+  mod = { T, sfx };
+  if (subscribed) return;
+  subscribed = true;
+
+  // meow-variety: every cat onClick already bumps meowCount
+  useScrollStore.subscribe((s, prev) => {
+    if (s.meowCount === prev.meowCount) return;
+    meow(s.meowCount);
+  });
+
+  // jump-land: null -> N page-flip whoosh; N -> null soft landing. Guarded so
+  // it is idempotent per transition and deep-jump safe.
+  useScrollStore.subscribe((s, prev) => {
+    if (s.jumpCover === prev.jumpCover) return;
+    const m = mod;
+    if (!m) return;
+    if (prev.jumpCover === null && s.jumpCover !== null) {
+      const p = ensure();
+      if (p) swish(p, m, 300, 1800, 0.18);
+    } else if (prev.jumpCover !== null && s.jumpCover === null) {
+      const p = ensure();
+      if (p) p.uiThud.triggerAttackRelease("C2", 0.12, m.T.now(), 0.7);
+    }
+  });
+}
